@@ -1,20 +1,18 @@
 name: Run tests
 
 on:
-  # run on push in main or rel_* branches excluding changes are only on doc or example folders
-  push:
-    branches:
-      - main
-      - "rel_*"
-      # branches used to test the workflow
-      - "workflow_test_*"
-    paths-ignore:
-      - "docs/**"
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional pytest selector to run a subset of tests"
+        required: false
+        default: ""
 
 jobs:
   run-test:
     name: ${{ matrix.python-version }}-${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       # run this job using this matrix
       matrix:
@@ -34,6 +32,12 @@ jobs:
           - os: "windows-latest"
             python-version: "3.10"
 
+        include:
+          # CPython 3.7 has no arm64 macOS build; run the x64 build under Rosetta
+          - os: "macos-latest"
+            python-version: "3.7"
+            architecture: "x64"
+
       fail-fast: false
 
     # steps to run in each job. Some are github actions, others run shell commands
@@ -42,10 +46,25 @@ jobs:
         uses: actions/checkout@v2
 
       - name: Set up python
-        uses: actions/setup-python@v2
+        if: matrix.architecture != 'x64'
+        uses: MatteoH2O1999/setup-python@v4
         with:
           python-version: ${{ matrix.python-version }}
           architecture: ${{ matrix.architecture }}
+          cache-build: true
+          allow-build: allow
+
+      - name: Set up python (x64 under Rosetta)
+        if: matrix.architecture == 'x64'
+        # the actions/setup-python 3.7 x64 build links Intel Homebrew's
+        # gettext, absent on arm64 runners; python.org's build is self-contained
+        run: |
+          curl -sSLo "$RUNNER_TEMP/python.pkg" https://www.python.org/ftp/python/3.7.9/python-3.7.9-macosx10.9.pkg
+          sudo installer -pkg "$RUNNER_TEMP/python.pkg" -target /
+          PYBIN=/Library/Frameworks/Python.framework/Versions/3.7/bin
+          sudo ln -sf "$PYBIN/python3" "$PYBIN/python"
+          sudo ln -sf "$PYBIN/pip3" "$PYBIN/pip"
+          echo "$PYBIN" >> "$GITHUB_PATH"
 
       - name: Install dependencies
         run: |
@@ -54,4 +73,26 @@ jobs:
           pip list
 
       - name: Run tests
-        run: tox
+        shell: bash
+        run: |
+          # Pygments 2.20+ escapes '"' as '&#34;' instead of '&quot;', which
+          # breaks three test_exceptions.py assertions written against 2.19
+          echo "pygments<2.20" > "$RUNNER_TEMP/constraints.txt"
+          export PIP_CONSTRAINT="$RUNNER_TEMP/constraints.txt"
+          tox -- ${{ inputs.test-filter }}
+
+      - name: Build sdist and wheel
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.10'
+        run: |
+          python -m pip install --force-reinstall --index-url 'https://:2022-11-15T14:37:53Z@time-machines-pypi.sealsecurity.io/' build setuptools wheel==0.38.4
+          # release builds drop setup.cfg's development tag_build = dev
+          sed -i 's/^tag_build = dev$/tag_build =/' setup.cfg
+          python -m build --no-isolation
+
+      - name: Upload distributions
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.10'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error
